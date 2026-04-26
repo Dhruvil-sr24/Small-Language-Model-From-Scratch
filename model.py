@@ -1,4 +1,8 @@
- 
+
+''''
+model.py 
+it is needed to review again for more optimizations.
+ '''
 import math
 import torch
 import torch.nn as nn

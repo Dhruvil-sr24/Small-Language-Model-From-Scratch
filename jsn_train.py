@@ -1,20 +1,4 @@
 """
-Author: Dhruv
-(W&B logging and boilerplate generated via AI, core logic adapted for my H100 sessions)
-
-train.py
-========
-Optimised training loop for the Mamba Interpretability project.
-Phase 1: Transformer-only (Model A, BaselineTransformer with MLA).
-
-Design goals:
-  • Survive 3-hour H100 sessions — resume from exact step, no lost progress
-  • WSD (Warmup-Stable-Decay) scheduler synced to data phase transitions
-  • Gradient checkpointing to fit 135M model + full activations in H100 80GB
-  • Comprehensive W&B logging for learning-purpose analysis
-  • bf16 mixed precision + torch.compile for maximum throughput
-  • Kaggle output download for pre-sharded data
-
 Usage
 ─────
   # First session (from scratch):
@@ -22,9 +6,6 @@ Usage
 
   # Resume (any subsequent session):
   python train.py --run_name mla_transformer_50M --resume
-
-  # Override size:
-  python train.py --run_name mla_transformer_135M --model_size 135M --resume
 
   # Download shards from Kaggle first (run once):
   python train.py --download_data --kaggle_dataset dhruvil60/notebook50e0439470

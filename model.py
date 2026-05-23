@@ -82,12 +82,7 @@ def config_135M() -> ModelConfig:
 
 # Using RMSNorm instead of LayerNorm here because it is faster and standard in modern open LLMs.
 class RMSNorm(nn.Module):
-    """
-    Root Mean Square Normalisation.
-    Used for: pre-norm on residual stream, QK-norm inside MLA, c_KV/c_Q norm.
-    No mean subtraction and no bias — lighter than LayerNorm, preferred in
-    all modern open LLMs (LLaMA, Mistral, DeepSeek, Mamba).
-    """
+     
     def __init__(self, d: int, eps: float = 1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(d))
@@ -145,12 +140,7 @@ class RotaryEmbedding(nn.Module):
 
 
 class SwiGLU(nn.Module):
-    """
-    SwiGLU feed-forward: FFN(x) = (silu(W_gate·x) * W_val·x) · W_out
-    Used identically in both models as the per-token feature transform.
-    LLaMA family, PaLM, and Mamba all use this — it consistently outperforms
-    standard ReLU FFN by ~0.5-1 perplexity point at equal compute.
-    """
+     
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.w_gate = nn.Linear(cfg.d_model, cfg.d_ff, bias=cfg.bias)
@@ -356,7 +346,7 @@ class TransformerBlock(nn.Module):
       x = x + SwiGLU(RMSNorm(x))
 
     The .attn attribute is MLAAttention — access .attn.last_c_kv for patching.
-    Used in Model A (all layers) and Model B (the 7% attention layers).
+    Used in Model.
 
     Gradient checkpointing is implemented INSIDE forward() via a stable
     _fwd_impl method. This is the only pattern torch.compile can trace
@@ -389,10 +379,7 @@ class TransformerBlock(nn.Module):
 
 
 class MLPBlock(nn.Module):
-    """
-    Pre-norm MLP-only block (the 50% of layers in the Mamba hybrid).
-      x = x + SwiGLU(RMSNorm(x))
-    """
+     
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.norm           = RMSNorm(cfg.d_model)
@@ -409,65 +396,10 @@ class MLPBlock(nn.Module):
         return self._fwd_impl(x)
 
 
-# --- 5. MAMBA-2 BLOCK ---
-
-def _import_mamba2():
-    try:
-        from mamba_ssm import Mamba2
-        return Mamba2
-    except ImportError:
-        raise ImportError(
-            "\nmamba_ssm is not installed.\n"
-            "Run:  pip install mamba-ssm causal-conv1d\n"
-            "Requires CUDA + compatible GPU (T4 / A100 / H100).\n"
-        )
-
-
-class Mamba2Block(nn.Module):
-    """
-    Mamba-2 (SSD) block in a pre-norm residual shell:
-      x = x + Mamba2(RMSNorm(x))
-
-    The Off-by-One motif:
-      Information about token T_i is written into SSM hidden state h_i,
-      which is only readable at position T_{i+1}. This temporal asymmetry
-      is ABSENT in MLA (which attends to T_i directly from T_i).
-      Detecting this motif via activation patching is a core Phase 3 goal.
-
-    .mamba gives direct access to the SSM kernel for hidden state patching.
-    """
-    def __init__(self, cfg: ModelConfig):
-        super().__init__()
-        Mamba2 = _import_mamba2()
-        self.norm  = RMSNorm(cfg.d_model)
-        self.mamba = Mamba2(
-            d_model    = cfg.d_model,
-            d_state    = cfg.d_state,
-            d_conv     = cfg.d_conv,
-            expand     = cfg.expand,
-            headdim    = cfg.headdim,
-            chunk_size = cfg.chunk_size,
-        )
-
-    def forward(self, x: torch.Tensor, **kw) -> torch.Tensor:
-        return x + self.mamba(self.norm(x))
-
-
 # --- 5b. GRADIENT CHECKPOINTING HELPER ---
 
 def enable_gradient_checkpointing(model: nn.Module) -> None:
-    """
-    Activates gradient checkpointing on all TransformerBlock and MLPBlock
-    layers by setting their use_checkpoint flag to True.
-
-    Must be called BEFORE torch.compile() so that Dynamo traces the
-    checkpointed path once and caches it stably — no recompilations.
-
-    Gradient checkpointing halves peak activation memory by discarding
-    intermediate activations during the forward pass and recomputing them
-    during backward. Cost: ~33% extra compute. Benefit: ~50% less VRAM,
-    enabling 2–4× larger batch sizes for the same GPU.
-    """
+   
     # from model_architecture import TransformerBlock, MLPBlock
     n = 0
     for module in model.modules():
@@ -477,66 +409,19 @@ def enable_gradient_checkpointing(model: nn.Module) -> None:
     print(f"[GradCkpt] Enabled on {n} blocks (TransformerBlock + MLPBlock)")
 
 
-# --- 6. HYBRID LAYER SCHEDULE ---
 
-def build_hybrid_layer_schedule(n_layers: int) -> List[str]:
-    """
-    Returns an ordered list of layer type strings for Model B.
-
-    Target ratios:
-      43% mamba | 7% attn | 50% mlp
-
-    Attention layers are placed at evenly-spaced depth positions.
-    Remaining positions alternate mamba / mlp (mamba first when tied)
-    to keep the exact 43:50 ratio.
-
-    Example (n_layers=24):
-      attn  : 2 layers  ( 8%)  at positions 0 and 23
-      mamba : 10 layers (42%)
-      mlp   : 12 layers (50%)
-    """
-    n_attn  = max(1, round(0.07 * n_layers))
-    n_mamba = round(0.43 * n_layers)
-    n_mlp   = n_layers - n_attn - n_mamba
-
-    # Space attention positions evenly across depth
-    if n_attn == 1:
-        attn_pos = {n_layers // 2}
-    else:
-        step     = (n_layers - 1) / (n_attn - 1)
-        attn_pos = {round(i * step) for i in range(n_attn)}
-
-    schedule, mc, lc = [], 0, 0
-    for i in range(n_layers):
-        if i in attn_pos:
-            schedule.append("attn")
-        elif mc < n_mamba and (lc >= n_mlp or mc <= lc):
-            schedule.append("mamba"); mc += 1
-        else:
-            schedule.append("mlp");   lc += 1
-
-    assert len(schedule) == n_layers
-    return schedule
-
-
-# --- 7. MODEL A — BASELINE TRANSFORMER  (MLA) ---
+# --- 7. MODEL  — BASELINE TRANSFORMER  (MLA) ---
 
 class BaselineTransformer(nn.Module):
     """
-    Model A: all-MLA decoder-only Transformer.
+    Model : all-MLA decoder-only Transformer.
 
-    Every layer is a TransformerBlock (MLA + SwiGLU).
-    Interpretability baseline for Phase 3 — circuits identified here
-    are compared against Model B layer-by-layer.
+    Every layer is a TransformerBlock (MLA + SwiGLU). 
 
     Design choice — MLA over standard MHA:
       1. Smaller KV cache: 81% fewer floats per token at inference.
-         This lets us cache activations for the FULL training set during
-         the Phase 3 interpretability experiments on 16GB T4 nodes.
       2. c_KV is the ideal causal patching target — it is the minimal
          vector that determines all K and V heads for a given position.
-      3. Matched architecture with Model B's attention layers ensures
-         truly 1:1 circuit comparison (same projection topology).
     """
 
     def __init__(self, cfg: ModelConfig):
@@ -602,11 +487,7 @@ class BaselineTransformer(nn.Module):
         top_p:          float = 0.9,
         eos_token_id:   Optional[int] = None,
     ) -> torch.Tensor:
-        """
-        Autoregressive generation with top-k / top-p / temperature sampling.
-        No KV-cache — reprocesses full context each step (fast enough for
-        114M model demos, generates ~50-100 tok/s on GPU).
-        """
+      
         self.eval()
         generated = input_ids.clone()
 
@@ -648,131 +529,17 @@ class BaselineTransformer(nn.Module):
         return sum(p.numel() for p in self.parameters())
 
 
-# --- 8. MODEL B — MAMBA-2 HYBRID ---
-
-class MambaHybrid(nn.Module):
-    """
-    Model B: Mamba-2 Hybrid with MLA attention layers.
-
-    Layer schedule (43 / 7 / 50 split):
-      mamba → Mamba2Block  — selective SSM, linear-time sequence mixing
-      attn  → TransformerBlock with MLAAttention
-      mlp   → MLPBlock     — SwiGLU per-token transform
-
-    Why MLA in the hybrid's attention layers?
-      The 7% attention layers serve as induction head seats. Using MLA
-      ensures the attention mechanism is identical to Model A — so if
-      a circuit is found in Model A's attention, we can check directly
-      whether the same circuit exists at the same topology in Model B.
-      Any difference MUST then be attributable to the surrounding Mamba
-      context rather than a different attention mechanism.
-
-    Interpretability hooks:
-      .layer_schedule          : List[str] of all layer types
-      .get_layer(i)            : direct layer i access
-      .get_attn_layers()       : [(i, TransformerBlock), ...]
-      .get_mamba_layers()      : [(i, Mamba2Block), ...]
-      forward(return_all_hidden=True)  → all_hidden: List[Tensor]
-      forward(store_attn_w=True)       → .attn.last_attn_w populated
-    """
-
-    def __init__(self, cfg: ModelConfig):
-        super().__init__()
-        self.cfg            = cfg
-        self.layer_schedule = build_hybrid_layer_schedule(cfg.n_layers)
-        self.embed          = nn.Embedding(cfg.vocab_size, cfg.d_model)
-        self.drop           = nn.Dropout(cfg.dropout)
-
-        layer_list = []
-        for lt in self.layer_schedule:
-            if   lt == "mamba": layer_list.append(Mamba2Block(cfg))
-            elif lt == "attn":  layer_list.append(TransformerBlock(cfg))
-            elif lt == "mlp":   layer_list.append(MLPBlock(cfg))
-            else: raise ValueError(f"Unknown layer type: {lt}")
-
-        self.layers  = nn.ModuleList(layer_list)
-        self.norm    = RMSNorm(cfg.d_model)
-        self.lm_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
-        self.lm_head.weight = self.embed.weight
-        self.apply(self._init_weights)
-        self._print_schedule()
-        print(f"[Model B] MambaHybrid  params: {self.count_params()/1e6:.1f}M")
-
-    # TODO: maybe check if we need to init bias differently?
-    def _init_weights(self, m: nn.Module):
-        if isinstance(m, nn.Linear):
-            scale = (self.cfg.mup_base_width / self.cfg.d_model) ** 0.5
-            nn.init.normal_(m.weight, mean=0.0, std=0.02 * scale)
-            if m.bias is not None: nn.init.zeros_(m.bias)
-        elif isinstance(m, nn.Embedding):
-            nn.init.normal_(m.weight, mean=0.0, std=0.02)
-
-    def _print_schedule(self):
-        from collections import Counter
-        c = Counter(self.layer_schedule)
-        n = len(self.layer_schedule)
-        print(f"[Model B] Layer schedule ({n} layers):")
-        for lt in ["mamba", "attn", "mlp"]:
-            print(f"  {lt:5s}: {c[lt]:3d} layers ({100*c[lt]/n:.0f}%)")
-        print(f"  Seq   : {' '.join(self.layer_schedule)}")
-
-    # ── Interpretability helpers ──────────────────────────────
-
-    def get_layer(self, i: int) -> nn.Module:
-        return self.layers[i]
-
-    def get_attn_layers(self) -> List[Tuple[int, TransformerBlock]]:
-        return [(i, l) for i, l in enumerate(self.layers)
-                if isinstance(l, TransformerBlock)]
-
-    def get_mamba_layers(self) -> List[Tuple[int, Mamba2Block]]:
-        return [(i, l) for i, l in enumerate(self.layers)
-                if isinstance(l, Mamba2Block)]
-
-    # ── Forward ──────────────────────────────────────────────
-
-    def forward(
-        self,
-        input_ids:         torch.Tensor,
-        targets:           Optional[torch.Tensor] = None,
-        return_all_hidden: bool = False,
-        store_attn_w:      bool = False,
-    ) -> Dict:
-        x          = self.drop(self.embed(input_ids))
-        all_hidden = [] if return_all_hidden else None
-
-        for layer in self.layers:
-            x = layer(x, store_attn_w=store_attn_w)
-            if return_all_hidden:
-                all_hidden.append(x.detach())
-
-        x      = self.norm(x)
-        logits = self.lm_head(x)
-        loss   = None
-        if targets is not None:
-            loss = F.cross_entropy(
-                logits.view(-1, self.cfg.vocab_size),
-                targets.view(-1), ignore_index=-1,
-            )
-        return {"logits": logits, "loss": loss, "hidden": x, "all_hidden": all_hidden}
-
-    def count_params(self) -> int:
-        return sum(p.numel() for p in self.parameters())
-
-
 # --- 9. FACTORY + UTILITIES ---
 
 def build_model(
-    model_type: Literal["transformer", "hybrid"],
+    model_type: Literal["transformer"],
     size:       Literal["50M", "135M"] = "50M",
     cfg:        Optional[ModelConfig]  = None,
 ) -> nn.Module:
     if cfg is None:
         cfg = config_50M() if size == "50M" else config_135M()
     if model_type == "transformer":
-        return BaselineTransformer(cfg)
-    if model_type == "hybrid":
-        return MambaHybrid(cfg)
+        return BaselineTransformer(cfg) 
     raise ValueError(f"Unknown model_type '{model_type}'")
 
 
@@ -791,10 +558,7 @@ def model_summary(model: nn.Module) -> str:
 
 
 def verify_forward_pass(model: nn.Module, cfg: ModelConfig, device: str = "cpu"):
-    """
-    Shape + loss check + interpretability hook verification.
-    Runs on CPU with T=64 so no GPU required for sanity checking.
-    """
+
     model = model.to(device).eval()
     B, T  = 2, min(64, cfg.seq_len)
     x     = torch.randint(0, cfg.vocab_size, (B, T), device=device)
@@ -808,9 +572,9 @@ def verify_forward_pass(model: nn.Module, cfg: ModelConfig, device: str = "cpu")
     assert out["loss"] is not None and out["loss"].item() > 0
     assert len(out["all_hidden"]) == cfg.n_layers
 
-    print(f"  ✓ logits      {tuple(out['logits'].shape)}")
-    print(f"  ✓ loss        {out['loss'].item():.4f}")
-    print(f"  ✓ all_hidden  {cfg.n_layers} layers × {tuple(out['all_hidden'][0].shape)}")
+    print(f"   logits      {tuple(out['logits'].shape)}")
+    print(f"   loss        {out['loss'].item():.4f}")
+    print(f"   all_hidden  {cfg.n_layers} layers × {tuple(out['all_hidden'][0].shape)}")
 
     # MLA interpretability hook checks
     first_attn = None
@@ -826,9 +590,9 @@ def verify_forward_pass(model: nn.Module, cfg: ModelConfig, device: str = "cpu")
         assert first_attn.last_c_q.shape  == (B, T, cfg.q_lora_rank)
         assert first_attn.last_attn_w is not None
         assert first_attn.last_attn_w.shape == (B, cfg.n_heads, T, T)
-        print(f"  ✓ c_KV latent {tuple(first_attn.last_c_kv.shape)}   (interp hook OK)")
-        print(f"  ✓ c_Q  latent {tuple(first_attn.last_c_q.shape)}")
-        print(f"  ✓ attn_w      {tuple(first_attn.last_attn_w.shape)}")
+        print(f"   c_KV latent {tuple(first_attn.last_c_kv.shape)}   (interp hook OK)")
+        print(f"   c_Q  latent {tuple(first_attn.last_c_q.shape)}")
+        print(f"   attn_w      {tuple(first_attn.last_attn_w.shape)}")
 
 
 # --- 10. ENTRY POINT ---
@@ -837,12 +601,12 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model",  choices=["transformer", "hybrid", "both"], default="both")
+    parser.add_argument("--model",  choices=["transformer"], default="both")
     parser.add_argument("--size",   choices=["50M", "135M"], default="50M")
     parser.add_argument("--verify", action="store_true")
     args = parser.parse_args()
 
-    targets = ["transformer", "hybrid"] if args.model == "both" else [args.model]
+    targets = ["transformer"] if args.model == "both" else [args.model]
     for mtype in targets:
         print(f"\n{'='*66}\n Building: {mtype.upper()}  ({args.size})\n{'='*66}")
         cfg   = config_50M() if args.size == "50M" else config_135M()

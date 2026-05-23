@@ -43,8 +43,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF",
                       "expandable_segments:True,max_split_size_mb:256")
 
 try:
-    import wandb
-    # wandb.login(key="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")
+    import wandb 
     WANDB_AVAILABLE = True
 except ImportError:
     WANDB_AVAILABLE = False
@@ -169,11 +168,7 @@ class TrainConfig:
 # ---
 
 class WSDScheduler:
-    """
-    Warmup → Stable → Decay learning rate schedule.
-    Framework-agnostic: call .get_lr(step) to compute the current LR,
-    then set it manually on the optimizer param groups.
-    """
+     
 
     def __init__(
         self,
@@ -234,19 +229,7 @@ class WSDScheduler:
 # ---
 
 def apply_gradient_checkpointing(model: nn.Module) -> nn.Module:
-    """
-    Delegates to model_architecture.enable_gradient_checkpointing().
-
-    The old closure-based monkey-patching approach broke torch.compile:
-    Dynamo saw a new function object on every recompile attempt
-    (guard: ___check_obj_id(orig_fwd, ...)) causing constant recompilation,
-    which both tanked MFU (~9.5% instead of ~35%) and prevented actual
-    memory savings — giving the worst of both worlds.
-
-    The correct pattern is to set a flag on each block BEFORE compile,
-    so Dynamo traces the checkpointed path once and caches it permanently.
-    See TransformerBlock._fwd_impl / MLPBlock._fwd_impl in model_architecture.py.
-    """
+     
     from model import enable_gradient_checkpointing
     enable_gradient_checkpointing(model)
     return model   # returns model for chaining (interface unchanged)
@@ -255,17 +238,7 @@ def apply_gradient_checkpointing(model: nn.Module) -> nn.Module:
 # --- 4. OPTIMIZER ---
 
 def build_optimizer(model: nn.Module, cfg: TrainConfig) -> torch.optim.Optimizer:
-    """
-    AdamW with weight decay applied only to 2D+ parameters (matrices),
-    NOT to biases, norms, or embeddings. This follows the standard
-    convention from GPT-2 and all subsequent work.
-
-    Parameter groups:
-      decay    : all weight matrices  (weight_decay applied)
-      no_decay : biases, norms, 1D params, embeddings
-
-    muP note: the LR is already scaled in TrainConfig.__post_init__.
-    """
+     
     decay_params    = []
     no_decay_params = []
     decay_names     = []
@@ -332,11 +305,7 @@ def save_checkpoint(
     Saves:
       checkpoint_NNNNNN.pt  — model weights + optimizer state + training state
       latest.json           — pointer to the most recent checkpoint
-
-    Automatically removes old checkpoints beyond keep_last_n.
-    Optimizer state is saved so momentum buffers carry over between sessions
-    — without this, the first steps of each resumed session behave as a
-    cold start and produce a visible loss spike.
+ 
     """
     ckpt_dir = Path(cfg.ckpt_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -382,10 +351,7 @@ def load_checkpoint(
     """
     Loads the latest checkpoint if one exists.
     Returns CheckpointState on success, None if no checkpoint found.
-
-    Handles the compiled model case: torch.compile wraps weights under
-    _orig_mod — we strip that prefix when loading so checkpoints are
-    compatible between compiled and non-compiled runs.
+ 
     """
     latest_path = Path(ckpt_dir) / "latest.json"
     if not latest_path.exists():
@@ -480,10 +446,7 @@ import kagglehub
 
 def download_kaggle_data(dataset: str, dest: str):
     """
-    Downloads pre-sharded data from a Kaggle kernel output.
-_
-    Requires:
-      pip install kagglehub
+    Downloads pre-sharded data from a Kaggle kernel output. 
 
     The Kaggle dataset dhruvil60/notebook50e0439470 contains:
       /stable/shard_*.npy   — 8B token stable-phase shards
@@ -524,10 +487,7 @@ def build_phase_dataloader(
     """
     Builds a DataLoader for one training phase.
     Returns (loader, estimated_total_steps).
-
-    skip_steps: number of steps already consumed in this phase —
-    the DataLoader will fast-forward past those shards on resume.
-    This is approximate (shard-level granularity, not exact step).
+ 
     """
     from data_pipeline import ShardedTokenDataset
 
@@ -641,8 +601,7 @@ class WandBLogger:
         Log MLA-specific internals:
           • c_KV norm — if this collapses, the KV bottleneck is dead
           • attention entropy per layer — low = sharp (good for copying tasks)
-
-        These are the most interpretability-relevant metrics during training.
+ 
         """
         if not self.enabled:
             return
@@ -722,13 +681,7 @@ def evaluate(
     device:      str,
     autocast_ctx,
 ) -> float:
-    """
-    Computes cross-entropy loss on a held-out sample from the eval set.
-    Uses the first shard of the stable phase as eval data (never seen
-    during training if we skip it, but for simplicity we just use a
-    fixed number of batches — the shard is large enough that overlap
-    is negligible and the loss is meaningful).
-    """
+    
     from data_pipeline import ShardedTokenDataset
 
     model.eval()

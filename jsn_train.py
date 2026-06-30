@@ -1,20 +1,4 @@
-"""
-Usage
-─────
-  # First session (from scratch):
-  python train.py --run_name mla_transformer_50M
-
-  # Resume (any subsequent session):
-  python train.py --run_name mla_transformer_50M --resume
-
-  # Download shards from Kaggle first (run once):
-  python train.py --download_data --kaggle_dataset dhruvil60/notebook50e0439470
-
-Data layout expected:
-  ./data/stable/shard_*.npy   (8B tokens)
-  ./data/anneal/shard_*.npy   (2B tokens)
-"""
-
+ 
 import os
 import sys
 import math
@@ -33,12 +17,9 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.utils.checkpoint import checkpoint_sequential
 
-
-# --- 0. OPTIONAL IMPORTS  (W&B — graceful degradation if missing) ---
+ 
 torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-# Prevents CUDA memory fragmentation (large reserved-but-unallocated blocks).
-# Set BEFORE any CUDA allocations — must be first CUDA-touching line.
+torch.backends.cudnn.allow_tf32 = True 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF",
                       "expandable_segments:True,max_split_size_mb:256")
 
@@ -53,75 +34,49 @@ except ImportError:
 # --- 1. TRAINING CONFIGURATION ---
 
 @dataclass
-class TrainConfig:
-    # ── Run identity ─────────────────────────────────────────
+class TrainConfig: 
     run_name:          str   = "mla_transformer_50M"
-    project:           str   = "mamba_interp"
-    model_size:        str   = "50M"           # "50M" or "135M"
+    project:           str   = "mla_interp"
+    model_size:        str   = "50M"           
     seed:              int   = 42
-
-    # ── Data ─────────────────────────────────────────────────
+ 
     stable_dir:        str   = "./data/tinystories_raw"
     anneal_dir:        str   = "./data/data/anneal"
     seq_len:           int   = 2048
-
-    # ── Batch geometry ───────────────────────────────────────
-    # H100 80GB: bf16, grad-ckpt, seq_len=2048
-    #   "50M" config (actually 114M with MLA) → batch=32, accum=2 → 131k tok/step
-    #   135M → batch_size=8,  grad_accum=8  → 131k tokens/step
-    # NEVER use batch_size=64 with grad_accum=1 — causes OOM on backward pass.
+  
     batch_size:        int   = 32
     grad_accum_steps:  int   = 2
-
-    # ── WSD Scheduler ────────────────────────────────────────
-    # Total tokens = stable(8B) + anneal(2B) = 10B
-    # With batch=16, seq=2048, accum=4: tokens_per_step = 131,072
-    # total_steps ≈ 10B / 131072 ≈ 76,294
-    # Warmup: 1% of stable phase (~600 steps) — short, model is small
-    # Stable: rest of stable phase, constant LR
-    # Decay:  entire anneal phase, linear decay to lr_min
-    warmup_steps:      int   = 600
-    # stable_steps and anneal_steps are computed from actual shard counts
-    # at runtime and stored in the checkpoint. Set 0 to auto-detect.
+  
+    warmup_steps:      int   = 600 
     stable_steps:      int   = 0
     anneal_steps:      int   = 0
-
-    # ── Learning rate ────────────────────────────────────────
-    # muP: base LR was tuned at d_model=256; scale as 256/d_model
-    # 50M  (d_model=512):  lr_base * (256/512) = 3e-3
-    # 135M (d_model=768):  lr_base * (256/768) = 2e-3
-    lr_max:            float = 3e-3    # overridden in __post_init__ for 135M
-    lr_min:            float = 3e-5    # 1% of lr_max at end of decay
-    lr_base_for_mup:   float = 6e-3    # reference LR at d_model=256
-
-    # ── Optimizer (NorMuon / AdamW) ──────────────────────────
-    optimizer_name:    str   = "adamw"  # "adamw" or "muon"
+ 
+    lr_max:            float = 3e-3     
+    lr_min:            float = 3e-5     
+    lr_base_for_mup:   float = 6e-3     
+ 
+    optimizer_name:    str   = "adamw"   
     weight_decay:      float = 0.1
     beta1:             float = 0.9
     beta2:             float = 0.95
     grad_clip:         float = 1.0
-
-    # ── Precision + compilation ───────────────────────────────
-    dtype:             str   = "bfloat16"   # "bfloat16" | "float16" | "float32"
-    compile_model:     bool  = True         # torch.compile — ~20% throughput gain
-    grad_checkpoint:   bool  = True         # activation checkpointing
-
-    # ── Checkpointing ────────────────────────────────────────
+ 
+    dtype:             str   = "bfloat16"    
+    compile_model:     bool  = True          
+    grad_checkpoint:   bool  = True          
+ 
     ckpt_dir:          str   = "./checkpoints"
-    save_every_steps:  int   = 500          # save full checkpoint
-    keep_last_n:       int   = 3            # number of checkpoints to keep
-    resume:            bool  = False        # auto-detect latest checkpoint
-
-    # ── Early stopping / fine-tuning ──────────────────────────
-    max_steps:         int   = 0            # 0 = run all data; >0 = stop after N steps
-    finetune_from:     str   = ""           # path to pretrained ckpt (loads weights only)
-
-    # ── Logging ──────────────────────────────────────────────
-    log_every_steps:   int   = 10           # W&B + console
-    eval_every_steps:  int   = 200          # eval loss on small held-out set
-    eval_tokens:       int   = 1_000_000    # ~2k steps worth of eval data
-
-    # ── Kaggle data download ──────────────────────────────────
+    save_every_steps:  int   = 500          
+    keep_last_n:       int   = 3             
+    resume:            bool  = False        
+ 
+    max_steps:         int   = 0             
+    finetune_from:     str   = ""           
+ 
+    log_every_steps:   int   = 10            
+    eval_every_steps:  int   = 200           
+    eval_tokens:       int   = 1_000_000     
+ 
     kaggle_dataset:    str   = "dhruvil60/notebook50e0439470"
     data_dest:         str   = "./data"
 
@@ -143,33 +98,9 @@ class TrainConfig:
         d["tokens_per_step"] = self.tokens_per_step
         return d
 
+ 
 
-# ---
-# 2. WSD LEARNING RATE SCHEDULER
-#
-#  Three phases, each with a distinct role:
-#
-#  WARMUP  (steps 0 → warmup_steps)
-#    Linear ramp 0 → lr_max.
-#    Prevents early gradient explosions from the random init.
-#
-#  STABLE  (steps warmup_steps → warmup+stable_steps)
-#    Constant lr_max throughout.
-#    Model sees the broad stable-phase data mixture at full LR.
-#    The flat region lets us switch to the anneal data without
-#    a confounding LR signal — we can isolate the data effect.
-#
-#  DECAY   (steps warmup+stable → total_steps)
-#    Linear lr_max → lr_min.
-#    Occurs EXACTLY while the DataLoader feeds anneal-phase data
-#    (Proof-Pile-2 + OpenWebMath).
-#    Falling LR forces the model to consolidate what it learns
-#    from the hard math data rather than overfit/forget it.
-# ---
-
-class WSDScheduler:
-     
-
+class WSDScheduler: 
     def __init__(
         self,
         lr_max:        float,
@@ -212,30 +143,15 @@ class WSDScheduler:
         """Overall training progress 0.0 → 1.0."""
         return min(1.0, step / max(self.total_steps, 1))
 
-
-# ---
-# 3. GRADIENT CHECKPOINTING WRAPPER
-#
-#  Gradient checkpointing trades compute for memory:
-#    Normal  : store ALL activations during forward → memory-heavy
-#    GC      : discard activations, recompute on backward → ~50% less RAM
-#
-#  This lets us use batch_size=16 on H100 for 135M — without GC
-#  we'd be limited to batch_size≈4 at seq_len=2048.
-#
-#  We checkpoint at the LAYER granularity (one segment per layer).
-#  This is the sweet spot — per-op checkpointing is slower;
-#  whole-model checkpointing can OOM on the recompute pass.
-# ---
+ 
 
 def apply_gradient_checkpointing(model: nn.Module) -> nn.Module:
      
     from model import enable_gradient_checkpointing
     enable_gradient_checkpointing(model)
-    return model   # returns model for chaining (interface unchanged)
+    return model    
 
-
-# --- 4. OPTIMIZER ---
+ 
 
 def build_optimizer(model: nn.Module, cfg: TrainConfig) -> torch.optim.Optimizer:
      
@@ -270,7 +186,7 @@ def build_optimizer(model: nn.Module, cfg: TrainConfig) -> torch.optim.Optimizer
         lr=cfg.lr_max,
         betas=(cfg.beta1, cfg.beta2),
         eps=1e-8,
-        fused=True,   # fused kernel — ~15% faster on CUDA
+        fused=True,   
     )
     return optimizer
 
@@ -280,8 +196,7 @@ def set_lr(optimizer: torch.optim.Optimizer, lr: float):
     for pg in optimizer.param_groups:
         pg["lr"] = lr
 
-
-# --- 5. CHECKPOINTING ---
+ 
 
 @dataclass
 class CheckpointState:
@@ -289,7 +204,7 @@ class CheckpointState:
     step:               int
     tokens_seen:        int
     phase:              str    # "stable" or "anneal"
-    phase_step:         int    # steps within current phase
+    phase_step:         int     
     best_eval_loss:     float
     stable_steps:       int    # total stable steps (for scheduler)
     anneal_steps:       int    # total anneal steps (for scheduler)
@@ -311,8 +226,7 @@ def save_checkpoint(
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     fname = ckpt_dir / f"checkpoint_{state.step:07d}.pt"
-
-    # torch.save with weights_only=False — we need the full state dict
+ 
     payload = {
         "step":           state.step,
         "tokens_seen":    state.tokens_seen,
@@ -326,13 +240,11 @@ def save_checkpoint(
         "cfg":            cfg.to_dict(),
     }
     torch.save(payload, fname)
-
-    # Update latest pointer
+ 
     latest = {"path": str(fname), "step": state.step}
     with open(ckpt_dir / "latest.json", "w") as f:
         json.dump(latest, f, indent=2)
-
-    # Rotate old checkpoints
+ 
     all_ckpts = sorted(ckpt_dir.glob("checkpoint_*.pt"))
     for old in all_ckpts[:-cfg.keep_last_n]:
         old.unlink()
@@ -373,10 +285,9 @@ def load_checkpoint(
     new_state  = {}
     for k, v in raw_state.items():
         new_state[k.replace("_orig_mod.", "")] = v
-
-    # Load into the inner (unwrapped) model if torch.compile was used
+ 
     target_model = model._orig_mod if hasattr(model, "_orig_mod") else model
-    # Also handle DDP wrapping: DDP -> compile -> actual model
+ 
     if hasattr(target_model, "_orig_mod"):
         target_model = target_model._orig_mod
     if hasattr(target_model, "module"):  # DDP wrapper
@@ -403,58 +314,15 @@ def load_checkpoint(
           f"({state.tokens_seen/1e9:.3f}B tokens seen, phase={state.phase})")
     return state
 
-
-# --- 6. DATASET UTILS ---
-
-# def download_kaggle_data(dataset: str, dest: str):
-#     """
-#     Downloads pre-sharded data from a Kaggle kernel output.
-
-#     Requires:
-#       pip install kaggle
-#       ~/.kaggle/kaggle.json  (API token from kaggle.com/account)
-
-#     The Kaggle dataset dhruvil60/notebook50e0439470 contains:
-#       /stable/shard_*.npy   — 8B token stable-phase shards
-#       /anneal/shard_*.npy   — 2B token anneal-phase shards
-#     """
-#     dest_path = Path(dest)
-#     dest_path.mkdir(parents=True, exist_ok=True)
-
-#     # Check if data already exists
-#     stable_shards = list((dest_path / "stable").glob("shard_*.npy"))
-#     if stable_shards:
-#         print(f"[Data] Found {len(stable_shards)} stable shards in {dest}. "
-#               f"Skipping download.")
-#         return
-
-#     print(f"[Data] Downloading {dataset} → {dest}")
-#     cmd = [
-#         "kaggle", "kernels", "output",
-#         dataset,
-#         "-p", dest,
-#     ]
-#     result = subprocess.run(cmd, capture_output=True, text=True)
-#     if result.returncode != 0:
-#         print(f"[Data] kaggle download failed:\n{result.stderr}")
-#         sys.exit(1)
-#     print(f"[Data] Download complete → {dest}")
+    
 import sys
 import shutil
 from pathlib import Path
 import kagglehub
 
-def download_kaggle_data(dataset: str, dest: str):
-    """
-    Downloads pre-sharded data from a Kaggle kernel output. 
-
-    The Kaggle dataset dhruvil60/notebook50e0439470 contains:
-      /stable/shard_*.npy   — 8B token stable-phase shards
-      /anneal/shard_*.npy   — 2B token anneal-phase shards
-    """
+def download_kaggle_data(dataset: str, dest: str): 
     dest_path = Path(dest)
-    dest_path.mkdir(parents=True, exist_ok=True) 
-    # Check if data already exists
+    dest_path.mkdir(parents=True, exist_ok=True)  
     stable_shards = list((dest_path / "stable").glob("shard_*.npy"))
     if stable_shards:
         print(f"[Data] Found {len(stable_shards)} stable shards in {dest}. "
@@ -462,11 +330,9 @@ def download_kaggle_data(dataset: str, dest: str):
         return
 
     print(f"[Data] Downloading {dataset} using kagglehub...")
-    try:
-        # kagglehub downloads to a central cache and returns the path
+    try: 
         cache_path = kagglehub.dataset_download("dhruvil60/jsn-sharded-data-for-slm")
-        
-        # Copy the contents from the cache into your target destination folder
+         
         shutil.copytree(cache_path, dest_path, dirs_exist_ok=True)
         
     except Exception as e:
@@ -558,11 +424,9 @@ class WandBLogger:
                 project = cfg.project,
                 name    = cfg.run_name,
                 config  = cfg.to_dict(),
-                resume  = "allow",           # resumes same run on same run_name
-                id      = cfg.run_name,      # stable ID = stable run for resume
-            )
-            # Watch model — logs gradient and weight histograms automatically
-            # log_freq=1000: expensive, log infrequently
+                resume  = "allow",             
+                id      = cfg.run_name,       
+            ) 
             wandb.watch(model, log="all", log_freq=1000, log_graph=False)
             print(f"[W&B] Initialised  project={cfg.project}  run={cfg.run_name}")
         else:
@@ -614,8 +478,7 @@ class WandBLogger:
             if not isinstance(layer, TransformerBlock):
                 continue
             attn = layer.attn
-
-            # c_KV norm (populated during forward — detached Tensor or None)
+ 
             if attn.last_c_kv is not None:
                 ckv_norm = attn.last_c_kv.norm(dim=-1).mean().item()
                 metrics[f"mla/c_kv_norm_L{i}"] = ckv_norm
@@ -638,20 +501,7 @@ class WandBLogger:
         if self.enabled:
             wandb.finish()
 
-
-# ---
-# 8. MFU (MODEL FLOP UTILISATION)
-#
-#  MFU = actual_flops_per_sec / peak_hardware_flops_per_sec
-#  Gives a hardware-independent efficiency signal.
-#  H100 bf16 peak: 989 TFLOPS (SXM5)
-#
-#  Approximate FLOPs for a Transformer forward+backward pass:
-#    ≈ 6 × N × T   where N = num params, T = seq_len
-#    (the 6 accounts for forward 2N + backward 4N in backward-dominates rule)
-#  With grad checkpointing, add ~33% recomputation:
-#    ≈ 8 × N × T
-# ---
+ 
 
 def estimate_mfu(
     model:            nn.Module,
@@ -668,8 +518,7 @@ def estimate_mfu(
     flops_per_sec = tokens_per_sec * flop_multiplier * n_params
     return flops_per_sec / h100_tflops
 
-
-# --- 9. EVALUATION ---
+ 
 
 @torch.no_grad()
 def evaluate(
@@ -689,7 +538,7 @@ def evaluate(
         shard_dir, 
         seq_len=seq_len, 
         shuffle_shards=False, 
-        prefix="val_shard_*.npy" # ADD THIS
+        prefix="val_shard_*.npy" 
     )
     loader = DataLoader(ds, batch_size=batch_size, num_workers=4)
 
@@ -713,11 +562,8 @@ def evaluate(
     model.train()
     return total_loss / max(total_tokens, 1)
 
-
-# --- 10. MAIN TRAINING LOOP ---
-
-def train(cfg: TrainConfig):
-    # ── DDP detection ────────────────────────────────────────
+ 
+def train(cfg: TrainConfig): 
     import torch.distributed as dist
     from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -734,12 +580,10 @@ def train(cfg: TrainConfig):
         device = "cuda" if torch.cuda.is_available() else "cpu"
         local_rank = 0
         is_main = True
-
-    # ── Reproducibility ──────────────────────────────────────
+ 
     torch.manual_seed(cfg.seed + local_rank)
     np.random.seed(cfg.seed + local_rank)
-
-    # ── Device + dtype ───────────────────────────────────────
+ 
     if is_main:
         print(f"[Setup] Device: {device}  |  dtype: {cfg.dtype}  |  DDP: {is_ddp}")
 
@@ -748,37 +592,30 @@ def train(cfg: TrainConfig):
                   "float32":  torch.float32}[cfg.dtype]
     autocast_ctx = torch.autocast(device_type="cuda", dtype=ptdtype) \
                    if "cuda" in device else nullcontext()
-
-    # ── Model ────────────────────────────────────────────────
+ 
     from model import BaselineTransformer, config_50M, config_135M
     model_cfg = config_50M() if cfg.model_size == "50M" else config_135M()
     # model     = BaselineTransformer(model_cfg).to(device)
     model = BaselineTransformer(model_cfg).to(device=device, dtype=ptdtype)
-
-    # ── Gradient checkpointing ────────────────────────────────
+ 
     if cfg.grad_checkpoint:
         model = apply_gradient_checkpointing(model)
-
-    # ── Optimizer ────────────────────────────────────────────
+ 
     optimizer = build_optimizer(model, cfg)
-
-    # ── Compile (skip for T4 / when --no_compile) ────────────
+ 
     if cfg.compile_model and "cuda" in device:
         if is_main:
             print("[Compile] Running torch.compile(max-autotune)...")
         model = torch.compile(model, mode="max-autotune-no-cudagraphs")
-
-    # ── DDP wrap (after compile, before checkpoint load) ─────
+ 
     if is_ddp:
         model = DDP(model, device_ids=[local_rank])
-
-    # ── Checkpoint resume / fine-tune ───────────────────────
+ 
     state = CheckpointState(
         step=0, tokens_seen=0, phase="stable", phase_step=0,
         best_eval_loss=float("inf"), stable_steps=0, anneal_steps=0,
     )
-    if cfg.finetune_from:
-        # Fine-tune mode: load model weights ONLY (no optimizer state, reset step)
+    if cfg.finetune_from: 
         print(f"[Finetune] Loading model weights from {cfg.finetune_from}")
         ckpt = torch.load(cfg.finetune_from, map_location=device, weights_only=False)
         raw_state = ckpt["model_state"]
@@ -794,8 +631,7 @@ def train(cfg: TrainConfig):
             state = loaded
         else:
             print("[Ckpt] No checkpoint found — starting from scratch")
-
-    # ── Dataloaders ──────────────────────────────────────────
+ 
     print(f"\n[Data] Building DataLoaders...")
     stable_loader, stable_total_steps = build_phase_dataloader(
         shard_dir      = cfg.stable_dir,
@@ -825,7 +661,7 @@ def train(cfg: TrainConfig):
     if state.anneal_steps == 0:
         state.anneal_steps = anneal_total_steps
 
-    # ── max_steps override ────────────────────────────────────
+    #  max_steps override  
     if cfg.max_steps > 0:
         total_steps = cfg.max_steps
         print(f"[Data] max_steps={total_steps:,} (overriding data-derived total)")
@@ -836,10 +672,8 @@ def train(cfg: TrainConfig):
           f"total={total_steps:,} steps")
     print(f"[Data] tokens/step={cfg.tokens_per_step:,}  "
           f"≈{total_steps * cfg.tokens_per_step / 1e9:.1f}B total tokens")
-
-    # ── Scheduler ────────────────────────────────────────────
-    if cfg.max_steps > 0:
-        # With max_steps: warmup → constant LR (no anneal decay)
+ 
+    if cfg.max_steps > 0: 
         scheduler = WSDScheduler(
             lr_max       = cfg.lr_max,
             lr_min       = cfg.lr_min,
@@ -855,15 +689,11 @@ def train(cfg: TrainConfig):
             stable_steps = state.stable_steps - cfg.warmup_steps,
             decay_steps  = state.anneal_steps,
         )
-
-    # ── W&B ──────────────────────────────────────────────────
+ 
     logger = WandBLogger(cfg, model, enabled=WANDB_AVAILABLE)
-
-    # ── Gradient scaler (float16 only — not needed for bf16) ─
+ 
     scaler = torch.cuda.amp.GradScaler(enabled=(cfg.dtype == "float16"))
-
-    # ── Active loader + iterator ──────────────────────────────
-    # Start from the correct phase if resuming mid-training
+ 
     if state.phase == "anneal":
         active_loader = anneal_loader
         active_phase  = "anneal"
@@ -872,9 +702,8 @@ def train(cfg: TrainConfig):
         active_phase  = "stable"
 
     data_iter       = iter(active_loader)
-    phase_switched  = (state.phase == "anneal")  # already switched if resuming in anneal
-
-    # ── Training state ────────────────────────────────────────
+    phase_switched  = (state.phase == "anneal")   
+   
     model.train()
     optimizer.zero_grad()
 
@@ -890,7 +719,7 @@ def train(cfg: TrainConfig):
     print(f"[Train] Target: {total_steps:,} steps  "
           f"({(total_steps - step) / max(total_steps, 1)*100:.1f}% remaining)\n") if is_main else None
 
-    # ── Grad scaler + phase-aware anneal switch function ──────
+     
     anneal_switch_logged = phase_switched
 
     def maybe_switch_to_anneal(current_step: int) -> bool:
@@ -910,20 +739,16 @@ def train(cfg: TrainConfig):
                 anneal_switch_logged = True
             return True
         return False
-
-    # ---
-    # MAIN LOOP
-    # ---
+ 
     while step < total_steps:
 
-        # ── Phase switch check ────────────────────────────────
+       
         maybe_switch_to_anneal(step)
 
-        # ── LR update (WSD) ───────────────────────────────────
+     
         lr = scheduler.get_lr(step)
         set_lr(optimizer, lr)
 
-        # ── Gradient accumulation loop ────────────────────────
         # accum_loss = 0.0
         # optimizer.zero_grad(set_to_none=True)
 
@@ -944,9 +769,7 @@ def train(cfg: TrainConfig):
         #         loss = out["loss"] / cfg.grad_accum_steps
 
         #     scaler.scale(loss).backward()
-        #     accum_loss += loss.item()
-        # ── Gradient accumulation loop ────────────────────────
-# ── Gradient accumulation loop ────────────────────────
+        #     accum_loss += loss.item() 
         accum_loss_tensor = torch.zeros(1, device=device, dtype=ptdtype)
         optimizer.zero_grad(set_to_none=True)
 
@@ -960,8 +783,7 @@ def train(cfg: TrainConfig):
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
 
-            # --- THE CUDA GRAPHS FIX ---
-            # Tell the compiler a new iteration is starting so it doesn't overwrite memory
+            # --- THE CUDA GRAPHS FIX --- 
             if hasattr(torch.compiler, "cudagraph_mark_step_begin"):
                 torch.compiler.cudagraph_mark_step_begin()
 
@@ -970,17 +792,16 @@ def train(cfg: TrainConfig):
                 loss = out["loss"] / cfg.grad_accum_steps
 
             scaler.scale(loss).backward()
-            accum_loss_tensor += loss.detach() # NO .item() HERE!
-
-        # Move to CPU exactly ONCE per step
+            accum_loss_tensor += loss.detach()  
+ 
         accum_loss = accum_loss_tensor.item()
-        # ── Gradient clipping ─────────────────────────────────
+         
         scaler.unscale_(optimizer)
         grad_norm = torch.nn.utils.clip_grad_norm_(
             model.parameters(), cfg.grad_clip
         ).item()
 
-        # ── Optimizer step ────────────────────────────────────
+ 
         scaler.step(optimizer)
         scaler.update()
         optimizer.zero_grad(set_to_none=True)
@@ -992,27 +813,21 @@ def train(cfg: TrainConfig):
         if len(recent_losses) > 50:
             recent_losses.pop(0)
 
-        # ── Throughput measurement ────────────────────────────
+ 
         t_now        = time.perf_counter()
         step_time    = t_now - t_step_start
         t_step_start = t_now
         tok_per_sec  = cfg.tokens_per_step / max(step_time, 1e-6)
         mfu          = estimate_mfu(model, tok_per_sec, cfg.seq_len,
                                     cfg.grad_checkpoint)
-
-        # ── W&B + console logging (rank 0 only in DDP) ────────
+ 
         if step % cfg.log_every_steps == 0 and is_main:
             smooth_loss = sum(recent_losses) / len(recent_losses)
             gpu_mem     = torch.cuda.memory_allocated() / 1e9 if device == "cuda" else 0.0
             lr_phase    = scheduler.phase_name(step)
             progress    = scheduler.progress(step) * 100
 
-            # ── Build single metrics dict ───────────────────────
-            # IMPORTANT: all metrics for a given step go into ONE dict
-            # passed to a SINGLE wandb.log(commit=True) call.
-            # Splitting across multiple wandb.log calls on the same step
-            # causes the "step N < current step N+1" monotonicity warning
-            # because each commit=True call advances the internal W&B counter.
+ 
             metrics = {
                 "train/loss":            accum_loss,
                 "train/loss_smooth":     smooth_loss,
@@ -1028,17 +843,15 @@ def train(cfg: TrainConfig):
                 "train/progress_pct":    progress,
             }
 
-            # ── MLA diagnostics (merged into same dict, same step) ─
-            # Only every 5×log_every steps to keep overhead low.
-            # store_attn_w runs a second forward — no_grad so no memory spike.
+ 
             if step % (cfg.log_every_steps * 5) == 0:
                 with torch.no_grad(), autocast_ctx:
                     _ = model(x[:2], targets=y[:2], store_attn_w=True)
-                # Collect MLA metrics directly — no separate wandb.log call
+            
                 from model import TransformerBlock
                 attn_entropies = []
                 for i, layer in enumerate(
-                    model._orig_mod.layers   # unwrap torch.compile's _orig_mod
+                    model._orig_mod.layers    
                     if hasattr(model, "_orig_mod") else model.layers
                 ):
                     if not isinstance(layer, TransformerBlock):
@@ -1058,10 +871,10 @@ def train(cfg: TrainConfig):
                         sum(attn_entropies) / len(attn_entropies)
                     )
 
-            # ── Single commit=True log call per step ──────────────
+  
             logger.log(metrics, step=step, commit=True)
 
-            # Console output
+           
             eta_steps = total_steps - step
             eta_hours = eta_steps * step_time / 3600
             print(
@@ -1077,7 +890,7 @@ def train(cfg: TrainConfig):
                 f"ETA {eta_hours:.1f}h"
             )
 
-        # ── Evaluation ────────────────────────────────────────
+      
         if step % cfg.eval_every_steps == 0 and is_main:
             eval_loss = evaluate(
                 model       = model,
@@ -1092,7 +905,7 @@ def train(cfg: TrainConfig):
 
             if eval_loss < best_eval_loss:
                 best_eval_loss = eval_loss
-                # Save lightweight best model (weights only — for chat.py)
+           
                 best_path = Path(cfg.ckpt_dir) / "best_model.pt"
                 best_path.parent.mkdir(parents=True, exist_ok=True)
                 inner_model = model._orig_mod if hasattr(model, "_orig_mod") else model
@@ -1102,14 +915,14 @@ def train(cfg: TrainConfig):
                     "step":        step,
                     "eval_loss":   eval_loss,
                 }, best_path)
-                print(f"  ★ New best eval loss: {eval_loss:.4f}  "
+                print(f"   New best eval loss: {eval_loss:.4f}  "
                       f"(ppl={math.exp(min(eval_loss,20)):.2f})  → saved {best_path}")
 
             print(f"  [Eval] loss={eval_loss:.4f}  "
                   f"ppl={math.exp(min(eval_loss,20)):.2f}  "
                   f"gap={accum_loss - eval_loss:+.4f}")
 
-        # ── Save checkpoint ───────────────────────────────────
+     
         if step % cfg.save_every_steps == 0 and is_main:
             ckpt_state = CheckpointState(
                 step           = step,
@@ -1122,7 +935,7 @@ def train(cfg: TrainConfig):
             )
             save_checkpoint(model, optimizer, ckpt_state, cfg)
 
-    # ── Final checkpoint ──────────────────────────────────────
+    
     print(f"\n[Train] Training complete at step {step:,}")
     ckpt_state = CheckpointState(
         step=step, tokens_seen=tokens_seen, phase=active_phase,
@@ -1134,22 +947,20 @@ def train(cfg: TrainConfig):
     print(f"[Train] Done. Best eval loss: {best_eval_loss:.4f}  "
           f"(ppl={math.exp(min(best_eval_loss,20)):.2f})")
 
-
-# --- 11. ENTRY POINT ---
-
+ 
 def parse_args() -> Tuple[TrainConfig, bool]:
     parser = argparse.ArgumentParser(
-        description="Train the Baseline Transformer (Model A) for Mamba Interp project",
+        description="Train the Baseline Transformer Interp project",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    # ── Identity ─────────────────────────────────────────────
+    # ── Identity  
     parser.add_argument("--run_name",      default="mla_transformer_50M")
-    parser.add_argument("--project",       default="mamba_interp")
+    parser.add_argument("--project",       default="mla_interp")
     parser.add_argument("--model_size",    default="50M", choices=["50M", "135M"])
     parser.add_argument("--seed",          type=int, default=42)
 
-    # ── Data ─────────────────────────────────────────────────
+    # ── Data  
     parser.add_argument("--stable_dir",    default="./data/tinystories_raw")
     parser.add_argument("--anneal_dir",    default="./data/data/anneal")
     parser.add_argument("--download_data", action="store_true",
@@ -1157,41 +968,41 @@ def parse_args() -> Tuple[TrainConfig, bool]:
     parser.add_argument("--kaggle_dataset",default="dhruvil60/notebook50e0439470")
     parser.add_argument("--data_dest",     default="./data")
 
-    # ── Batch ─────────────────────────────────────────────────
+    # ── Batch  
     parser.add_argument("--batch_size",    type=int, default=32)
     parser.add_argument("--grad_accum",    type=int, default=2,
                         dest="grad_accum_steps")
     parser.add_argument("--seq_len",       type=int, default=2048)
 
-    # ── Schedule ─────────────────────────────────────────────
+    # ── Schedule  
     parser.add_argument("--warmup_steps",  type=int, default=600)
 
-    # ── Optimiser ─────────────────────────────────────────────
+    # ── Optimiser  
     parser.add_argument("--lr_max",        type=float, default=0.0,
                         help="0 = auto (muP)")
     parser.add_argument("--weight_decay",  type=float, default=0.1)
     parser.add_argument("--grad_clip",     type=float, default=1.0)
 
-    # ── Precision ─────────────────────────────────────────────
+    # ── Precision  
     parser.add_argument("--dtype",         default="bfloat16",
                         choices=["bfloat16","float16","float32"])
     parser.add_argument("--no_compile",    action="store_true")
     parser.add_argument("--no_grad_ckpt",  action="store_true")
 
-    # ── Checkpointing ─────────────────────────────────────────
+    # ── Checkpointing  
     parser.add_argument("--ckpt_dir",      default="./checkpoints")
     parser.add_argument("--save_every",    type=int, default=500,
                         dest="save_every_steps")
     parser.add_argument("--resume",        action="store_true",
                         help="Resume from latest checkpoint")
 
-    # ── Early stop / fine-tune ────────────────────────────────
+    # ── Early stop / fine-tune  
     parser.add_argument("--max_steps",     type=int, default=0,
                         help="Stop after N steps (0=auto from data)")
     parser.add_argument("--finetune_from", type=str, default="",
                         help="Path to pretrained ckpt (loads weights only, resets optimizer)")
 
-    # ── Logging ──────────────────────────────────────────────
+    # ── Logging  
     parser.add_argument("--log_every",     type=int, default=10,
                         dest="log_every_steps")
     parser.add_argument("--eval_every",    type=int, default=200,
@@ -1238,7 +1049,7 @@ if __name__ == "__main__":
     cfg, do_download = parse_args()
 
     print("=" * 66)
-    print(f" Mamba Interpretability — Training  |  Model A (Transformer)")
+    print(f" MLA Interpretability — Training (Transformer)")
     print(f" run  : {cfg.run_name}")
     print(f" size : {cfg.model_size}  |  dtype: {cfg.dtype}")
     print(f" batch: {cfg.batch_size} × accum {cfg.grad_accum_steps} "

@@ -11,26 +11,19 @@ from dataclasses import dataclass, field
 from typing import Optional, Literal, List, Tuple, Dict
 from einops import rearrange
 
-
-# --- 1. CONFIGURATION ---
+ 
 
 @dataclass
-class ModelConfig:
-    # ── Vocabulary / sequence
+class ModelConfig: 
     vocab_size:       int   = 32_768
     seq_len:          int   = 2048
 
-    # ── Model dimensions
+    
     d_model:          int   = 512
     n_layers:         int   = 24
-    d_ff:             int   = 2048       # SwiGLU inner dim
+    d_ff:             int   = 2048        
 
-    # ── MLA attention
-    #   n_heads      : Q heads  (high — Q compression is cheap)
-    #   n_kv_heads   : K/V heads after decompression  (n_heads // 4)
-    #   kv_lora_rank : dim of compressed KV latent c_KV  (~d_model // 4)
-    #   q_lora_rank  : dim of compressed Q latent c_Q    (~d_model // 2)
-    #   qk_rope_dim  : per-head dims that receive RoPE rotation
+ 
     n_heads:          int   = 8
     n_kv_heads:       int   = 2
     kv_lora_rank:     int   = 128
@@ -38,20 +31,13 @@ class ModelConfig:
     qk_rope_dim:      int   = 32
     qk_norm_eps:      float = 1e-6
 
-    # ── Regularisation
+    
     dropout:          float = 0.0
     bias:             bool  = False
 
     # ── muP scaling
     mup_base_width:   int   = 256
-
-    # ── Mamba-2 (Model B only)
-    d_state:          int   = 128
-    d_conv:           int   = 4
-    expand:           int   = 2
-    headdim:          int   = 64
-    chunk_size:       int   = 256
-
+ 
     # ── RoPE
     rope_base:        int   = 500_000    # LLaMA-3 style long-context base
 
@@ -77,10 +63,8 @@ def config_135M() -> ModelConfig:
         d_ff=3072,   kv_lora_rank=192, q_lora_rank=384, qk_rope_dim=32,
     )
 
-
-# --- 2. PRIMITIVE BUILDING BLOCKS ---
-
-# Using RMSNorm instead of LayerNorm here because it is faster and standard in modern open LLMs.
+ 
+ 
 class RMSNorm(nn.Module):
      
     def __init__(self, d: int, eps: float = 1e-6):
@@ -213,13 +197,13 @@ class MLAAttention(nn.Module):
         self.kv_rank    = cfg.kv_lora_rank
         self.q_rank     = cfg.q_lora_rank
 
-        # ── Q compression ────────────────────────────────────
+        # ── Q compression 
         self.W_DQ  = nn.Linear(cfg.d_model, cfg.q_lora_rank,             bias=cfg.bias)
         self.q_ln  = RMSNorm(cfg.q_lora_rank, eps=cfg.qk_norm_eps)
         self.W_UQ  = nn.Linear(cfg.q_lora_rank, cfg.n_heads * self.d_nope, bias=cfg.bias)
         self.W_QR  = nn.Linear(cfg.q_lora_rank, cfg.n_heads * self.d_rope, bias=cfg.bias)
 
-        # ── KV compression ───────────────────────────────────
+        # ── KV compression  
         self.W_DKV = nn.Linear(cfg.d_model, cfg.kv_lora_rank,            bias=cfg.bias)
         self.kv_ln = RMSNorm(cfg.kv_lora_rank, eps=cfg.qk_norm_eps)
         self.W_UK  = nn.Linear(cfg.kv_lora_rank, cfg.n_kv_heads * self.d_nope, bias=cfg.bias)
@@ -231,16 +215,14 @@ class MLAAttention(nn.Module):
         self.q_head_norm = RMSNorm(self.head_dim, eps=cfg.qk_norm_eps)
         self.k_head_norm = RMSNorm(self.head_dim, eps=cfg.qk_norm_eps)
 
-        # ── RoPE ─────────────────────────────────────────────
+        # ── RoPE  
         self.rotary = RotaryEmbedding(cfg.qk_rope_dim, max_seq=cfg.seq_len,
                                        base=cfg.rope_base)
 
-        # ── Value residual ────────────────────────────────────
-        # x bypasses the entire attention computation and is added to v.
-        # Ensures gradient flows even when attn weights are uniform.
+        # ── Value residual   
         self.W_VR  = nn.Linear(cfg.d_model, cfg.n_heads * self.head_dim, bias=cfg.bias)
 
-        # ── Output projection ─────────────────────────────────
+        # ── Output projection  
         self.W_O   = nn.Linear(cfg.n_heads * self.head_dim, cfg.d_model, bias=cfg.bias)
         self.drop  = nn.Dropout(cfg.dropout)
 
@@ -271,7 +253,7 @@ class MLAAttention(nn.Module):
     ) -> torch.Tensor:
         B, T, D = x.shape
 
-        # ── Q PATH ───────────────────────────────────────────
+        # ── Q PATH  
         c_q    = self.q_ln(self.W_DQ(x))                         # (B, T, q_rank)
         self.last_c_q = c_q.detach()
 
@@ -280,9 +262,9 @@ class MLAAttention(nn.Module):
         q_nope = rearrange(q_nope, "b t (h d) -> b h t d", h=self.n_heads)
         q_rope = rearrange(q_rope, "b t (h d) -> b h t d", h=self.n_heads)
 
-        # ── KV PATH ──────────────────────────────────────────
+        # ── KV PATH  
         c_kv   = self.kv_ln(self.W_DKV(x))                       # (B, T, kv_rank)
-        self.last_c_kv = c_kv.detach()                           # ← interpretability hook
+        self.last_c_kv = c_kv.detach()                           # interpretability hook
 
         k_nope = self.W_UK(c_kv)                                 # (B, T, n_kv * d_nope)
         v      = self.W_UV(c_kv)                                 # (B, T, n_kv * head_dim)
@@ -291,24 +273,23 @@ class MLAAttention(nn.Module):
         k_rope = rearrange(k_rope, "b t (h d) -> b h t d", h=self.n_kv_heads)
         v      = rearrange(v,      "b t (h d) -> b h t d", h=self.n_kv_heads)
 
-        # ── RoPE (only on the rope sub-dimensions) ────────────
+        # ── RoPE (only on the rope sub-dimensions)  
         q_rope, k_rope = self.rotary(q_rope, k_rope)
 
-        # ── Reconstruct full Q and K ──────────────────────────
+        # ── Reconstruct full Q and K  
         q = torch.cat([q_nope, q_rope], dim=-1)                  # (B, n_h, T, head_dim)
         k = torch.cat([k_nope, k_rope], dim=-1)                  # (B, n_kv, T, head_dim)
 
-        # ── QK-Norm (per head, after cat) ─────────────────────
+        # ── QK-Norm (per head, after cat)  
         q = self.q_head_norm(q)
         k = self.k_head_norm(k)
 
-        # ── GQA expansion ────────────────────────────────────
+        # ── GQA expansion  
         k = self._repeat_kv(k, self.kv_groups)                   # (B, n_h, T, head_dim)
         v = self._repeat_kv(v, self.kv_groups)                   # (B, n_h, T, head_dim)
 
-        # ── Attention ─────────────────────────────────────────
-        if store_attn_w:
-            # Manual path: materialise weights for interpretability.
+        # ── Attention  
+        if store_attn_w: 
             # Uses more memory but exposes the (B, n_heads, T, T) weight matrix.
             scale   = self.head_dim ** -0.5
             scores  = torch.matmul(q, k.transpose(-2, -1)) * scale
@@ -328,16 +309,16 @@ class MLAAttention(nn.Module):
             )
             self.last_attn_w = None
 
-        # ── Value residual ────────────────────────────────────
+        # ── Value residual  
         v_res    = rearrange(self.W_VR(x), "b t (h d) -> b h t d", h=self.n_heads)
         attn_out = attn_out + v_res
 
-        # ── Output projection ─────────────────────────────────
+        # ── Output projection  
         out = rearrange(attn_out, "b h t d -> b t (h d)")
         return self.drop(self.W_O(out))
 
 
-# --- 4. BLOCK WRAPPERS ---
+ 
 
 class TransformerBlock(nn.Module):
     """
@@ -347,12 +328,7 @@ class TransformerBlock(nn.Module):
 
     The .attn attribute is MLAAttention — access .attn.last_c_kv for patching.
     Used in Model.
-
-    Gradient checkpointing is implemented INSIDE forward() via a stable
-    _fwd_impl method. This is the only pattern torch.compile can trace
-    without recompilation — monkey-patching forward() externally causes
-    Dynamo to see a different function object every recompile and triggers
-    the "check_obj_id" guard failure that kills MFU.
+ 
     """
     def __init__(self, cfg: ModelConfig):
         super().__init__()
@@ -360,7 +336,7 @@ class TransformerBlock(nn.Module):
         self.attn           = MLAAttention(cfg)
         self.norm2          = RMSNorm(cfg.d_model)
         self.mlp            = SwiGLU(cfg)
-        self.use_checkpoint = False   # toggled by enable_gradient_checkpointing()
+        self.use_checkpoint = False    
 
     def _fwd_impl(self, x: torch.Tensor, store_attn_w: bool) -> torch.Tensor:
         """Actual computation — separated so checkpoint() has a stable target."""
@@ -370,10 +346,7 @@ class TransformerBlock(nn.Module):
 
     def forward(self, x: torch.Tensor, store_attn_w: bool = False, **kw) -> torch.Tensor:
         if self.use_checkpoint and self.training:
-            from torch.utils.checkpoint import checkpoint
-            # use_reentrant=False: required for torch.compile + AMP correctness.
-            # Passes store_attn_w as a positional arg — checkpoint() supports
-            # non-tensor positional args in use_reentrant=False mode (PyTorch 2.0+).
+            from torch.utils.checkpoint import checkpoint 
             return checkpoint(self._fwd_impl, x, store_attn_w, use_reentrant=False)
         return self._fwd_impl(x, store_attn_w)
 
@@ -395,12 +368,11 @@ class MLPBlock(nn.Module):
             return checkpoint(self._fwd_impl, x, use_reentrant=False)
         return self._fwd_impl(x)
 
-
-# --- 5b. GRADIENT CHECKPOINTING HELPER ---
+ 
 
 def enable_gradient_checkpointing(model: nn.Module) -> None:
    
-    # from model_architecture import TransformerBlock, MLPBlock
+   
     n = 0
     for module in model.modules():
         if isinstance(module, (TransformerBlock, MLPBlock)):
@@ -409,8 +381,7 @@ def enable_gradient_checkpointing(model: nn.Module) -> None:
     print(f"[GradCkpt] Enabled on {n} blocks (TransformerBlock + MLPBlock)")
 
 
-
-# --- 7. MODEL  — BASELINE TRANSFORMER  (MLA) ---
+ 
 
 class BaselineTransformer(nn.Module):
     """
@@ -499,12 +470,12 @@ class BaselineTransformer(nn.Module):
             out    = self(idx)
             logits = out["logits"][:, -1, :] / max(temperature, 1e-8)
 
-            # ── Top-k filtering ──────────────────────────────
+            # ── Top-k filtering  
             if top_k > 0:
                 topk_vals = torch.topk(logits, min(top_k, logits.size(-1)))[0]
                 logits[logits < topk_vals[:, -1:]] = float("-inf")
 
-            # ── Top-p (nucleus) filtering ─────────────────────
+            # ── Top-p (nucleus) filtering  
             if top_p < 1.0:
                 sorted_logits, sorted_idx = torch.sort(logits, descending=True)
                 cum_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
@@ -529,8 +500,7 @@ class BaselineTransformer(nn.Module):
         return sum(p.numel() for p in self.parameters())
 
 
-# --- 9. FACTORY + UTILITIES ---
-
+ 
 def build_model(
     model_type: Literal["transformer"],
     size:       Literal["50M", "135M"] = "50M",
@@ -595,7 +565,7 @@ def verify_forward_pass(model: nn.Module, cfg: ModelConfig, device: str = "cpu")
         print(f"   attn_w      {tuple(first_attn.last_attn_w.shape)}")
 
 
-# --- 10. ENTRY POINT ---
+ 
 
 if __name__ == "__main__":
     import argparse

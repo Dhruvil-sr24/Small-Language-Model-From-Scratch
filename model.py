@@ -371,8 +371,6 @@ class MLPBlock(nn.Module):
  
 
 def enable_gradient_checkpointing(model: nn.Module) -> None:
-   
-   
     n = 0
     for module in model.modules():
         if isinstance(module, (TransformerBlock, MLPBlock)):

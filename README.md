@@ -1,6 +1,6 @@
 # Small Language Model with Multi-Head Latent Attention (MLA)
 
-A from-scratch implementation and training of a 114M parameter decoder-only Transformer language model. This project focuses on integrating advanced architectural improvements, particularly Multi-Head Latent Attention (MLA), to build a highly efficient LLM. The model was trained on the TinyStories dataset to demonstrate efficient architecture design and training pipelines.
+Reproduce and extend modern decoder-only LLM architecture by replacing standard multi-head attention with DeepSeek-V2 Multi-Head Latent Attention to study memory-efficient inference and training dynamics. This project focuses on integrating advanced architectural improvements, particularly Multi-Head Latent Attention (MLA), to build a highly efficient LLM. The model was trained on the TinyStories dataset to demonstrate efficient architecture design and training pipelines.
 
 ## Key Features
 
